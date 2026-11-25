@@ -1,0 +1,714 @@
+GIGACHAT API LOGIC
+
+ОБЩЕЕ ОПИСАНИЕ
+
+Базовый URL для всех запросов, кроме получения токена: https://api.giga.chat
+
+Старый URL https://gigachat.devices.sberbank.ru/ оставлен только для совместимости. Новые подключения должны использовать https://api.giga.chat.
+
+Аутентификация двухэтапная. Сначала используется постоянный ключ авторизации Authorization key. Это строка Base64 от пары Client ID и Client Secret. Ключ передаётся в заголовке Authorization: Basic <ключ> только в запросе на получение токена. Затем получается временный access token. Он живёт 30 минут и передаётся в заголовке Authorization: Bearer <токен> во всех остальных запросах.
+
+ПОЛНЫЙ ПЕРЕЧЕНЬ ЭНДПОИНТОВ
+
+1) POST /api/v2/oauth — получить access token.
+2) GET /v1/models — получить список доступных моделей.
+3) POST /v1/chat/completions — генерация ответа, версия v1.
+4) POST /v2/chat/completions — генерация ответа, версия v2 с инструментами и параллельными функциями.
+5) POST /v1/embeddings — получить векторное представление текста.
+6) POST /v1/functions/validate — проверить описание пользовательской функции.
+7) POST /v1/ai/check — проверить текст на генерацию ИИ.
+8) POST /v1/files — загрузить файл в хранилище.
+9) GET /v1/files — получить список файлов.
+10) GET /v1/files/{file_id}/content — скачать файл.
+11) POST /v1/files/{file}/delete — удалить файл.
+12) POST /v1/batches — создать пакетную задачу.
+13) GET /v1/batches — получить статус пакетных задач.
+
+ТИПОВЫЕ СЦЕНАРИИ
+
+Сценарий A. Базовый чат.
+1) POST /api/v2/oauth — получить access_token.
+2) GET /v1/models — выбрать model, например GigaChat-2-Max.
+3) POST /v1/chat/completions с заголовком Bearer — получить ответ модели.
+
+Сценарий B. Чат с пользовательской функцией.
+1) POST /api/v2/oauth — получить token.
+2) При необходимости POST /v1/functions/validate — проверить описание функции.
+3) POST /v1/chat/completions с массивом functions и function_call: auto.
+4) Модель возвращает message.function_call с аргументами.
+5) Выполнить функцию на своей стороне.
+6) POST /v1/chat/completions с историей: assistant с function_call и function с результатом.
+7) Модель возвращает финальный текстовый ответ.
+
+Сценарий C. Чат с файлами.
+1) POST /api/v2/oauth — получить token.
+2) POST /v1/files multipart — получить file_id.
+3) POST /v1/chat/completions. В v1 передать attachments: [file_id] в сообщении user. В v2 передать content: [{ text: "...", files: [{ id: file_id }] }].
+4) Получить ответ модели.
+
+Сценарий D. Генерация изображения встроенной функцией text2image.
+1) POST /api/v2/oauth — получить token.
+2) POST /v1/chat/completions с function_call: auto.
+3) Модель вызывает text2image и возвращает в content конструкцию <img src="file_id"/>.
+4) GET /v1/files/{file_id}/content с тем же X-Client-ID, что был при генерации, — скачать изображение.
+
+Сценарий E. Эмбеддинги.
+1) POST /api/v2/oauth — получить token.
+2) POST /v1/embeddings с input, строкой или массивом строк, и model.
+3) Получить массив векторов.
+
+Сценарий F. Пакетная обработка.
+1) POST /api/v2/oauth — получить token.
+2) Сформировать JSONL-файл. Каждая строка — запрос chat/completions или embeddings.
+3) POST /v1/batches?method=chat_completions с application/octet-stream — получить batch_id.
+4) Периодически GET /v1/batches?batch_id=... — проверять status.
+5) Когда status равен completed, GET /v1/files/{output_file_id}/content — скачать результаты.
+
+ОБЩИЕ ЗАГОЛОВКИ ДЛЯ ЗАПРОСОВ КРОМЕ OAUTH
+
+Authorization: Bearer <token> — обязателен для авторизации.
+Accept: application/json — рекомендуется.
+Content-Type: application/json — обязателен для JSON-тела.
+X-Client-ID — необязательный идентификатор пользователя. Обязателен при скачивании изображений, сгенерированных по этому идентификатору.
+X-Request-ID — необязательный идентификатор запроса для логов. Если не передан, API сгенерирует UUIDv4.
+X-Session-ID — необязательный идентификатор сессии для логов. Если не передан, API сгенерирует UUIDv4.
+User-Agent — необязательный идентификатор клиента. Помогает избежать ошибок авторизации.
+
+КЛЮЧЕВЫЕ ОГРАНИЧЕНИЯ
+
+Токен живёт 30 минут.
+Запросов на получение токена можно отправлять до 10 в секунду.
+Текст сообщений content передавать в UTF-8 для экономии токенов.
+Системный промпт role system может быть только один и только первым в messages.
+В одном сообщении можно передать только одно изображение.
+В одной сессии можно передать до 10 изображений.
+Общий размер запроса с изображениями и аудио должен быть меньше 80 Мб.
+Максимальный размер одного аудиофайла 35 Мб.
+Максимальный размер одного изображения 15 Мб.
+Максимальный размер одного текстового файла 40 Мб.
+При превышении контекста модели возвращается ошибка 422.
+Модель GigaChat-3-Ultra доступна только физическим лицам в рамках freemium.
+Параллельные функции доступны только при обращении к GigaChat-3-Ultra.
+AI-check доступен только юридическим лицам на pay-as-you-go.
+Пакетный режим доступен только на pay-as-you-go.
+
+РАЗДЕЛ АУТЕНТИФИКАЦИИ
+
+Шаг 1. Получить ключ авторизации вне API. В личном кабинете GigaChat API создать проект и получить Authorization key. Это строка Base64(Client ID : Client Secret). Можно сгенерировать самостоятельно как base64(ClientID + ":" + ClientSecret).
+
+Шаг 2. Получить access token.
+
+Запрос:
+POST https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+RqUID: <uuid4, сгенерировать самостоятельно>
+Authorization: Basic <ключ_авторизации>
+
+Тело urlencoded:
+scope=GIGACHAT_API_PERS
+
+Значения scope:
+GIGACHAT_API_PERS — доступ для физических лиц.
+GIGACHAT_API_B2B — доступ для ИП и юридических лиц по платным пакетам.
+GIGACHAT_API_CORP — доступ для ИП и юридических лиц по pay-as-you-go.
+
+Успешный ответ 200:
+{
+  "access_token": "eyJhbGci...",
+  "expires_at": 1679471442
+}
+
+expires_at — unix timestamp в миллисекундах. Токен действует 30 минут.
+
+Ошибка 401:
+{
+  "code": 6,
+  "message": "credentials doesn't match db data"
+}
+
+Шаг 3. Использовать токен во всех остальных запросах:
+Authorization: Bearer <access_token>
+
+Правила: токен кэшировать и переиспользовать до истечения 30 минут. Не чаще 10 запросов на токен в секунду. RqUID обязателен, формат UUIDv4, генерируется на каждый запрос токена.
+
+РАЗДЕЛ МОДЕЛЕЙ
+
+Запрос:
+GET https://api.giga.chat/v1/models
+Authorization: Bearer <token>
+Accept: application/json
+
+Ответ 200:
+{
+  "data": [
+    {
+      "id": "GigaChat:2.0.28.2",
+      "object": "model",
+      "owned_by": "salutedevices",
+      "type": "chat"
+    }
+  ],
+  "object": "list"
+}
+
+Поле type может быть chat для генерации текста, aicheck для проверки текста на ИИ, embedder для эмбеддингов.
+
+Поле id подставляется в параметр model запросов /chat/completions и /embeddings. Модели с суффиксом -preview относятся к раннему доступу.
+
+Ошибка 401:
+{
+  "status": 401,
+  "message": "Unauthorized"
+}
+
+РАЗДЕЛ ГЕНЕРАЦИИ ОТВЕТА V1
+
+Метод: POST https://api.giga.chat/v1/chat/completions
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Обязательные поля тела: model и messages.
+
+model — строка, ID модели из /v1/models, например GigaChat-2-Max.
+messages — массив истории сообщений.
+
+Структура messages. Каждый элемент — объект с role и content.
+role system: content — строка, системный промпт. Только первое сообщение и максимум одно.
+role user: content — строка, сообщение пользователя. Дополнительно может быть attachments — массив file_id.
+role assistant: content — строка, ответ модели. Дополнительно могут быть function_call и functions_state_id.
+role function: content — строка с JSON-объектом результата работы функции.
+
+Правило: системный промпт только первым и только один. Иначе ошибка 422 с сообщением Invalid params: system message must be the first message.
+
+Необязательные поля тела:
+function_call — строка none, строка auto или объект {"name":"func"}.
+functions — массив описаний пользовательских функций.
+temperature — float больше 0. Регулирует случайность. При значении меньше 0.001 включается строгий контроль. При значении больше 2 реакция становится чрезмерно беспорядочной.
+top_p — float от 0 до 1. Альтернатива temperature. Задаёт вероятностную массу токенов.
+max_tokens — целое больше 0. Максимум токенов ответа.
+repetition_penalty — float. Значение 1.0 нейтральное. При значении больше 1 модель старается не повторять слова.
+stream — boolean. Включает SSE-стриминг. Поток завершается событием data: [DONE].
+update_interval — number. Минимальный интервал в секундах между отправкой токенов в потоковом режиме.
+response_format — объект. Для текста {"type":"text"}. Для JSON {"type":"json_schema","schema":{...},"strict":true}.
+
+Структура описания функции в functions:
+{
+  "name": "weather_forecast",
+  "description": "Прогноз погоды",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "location": {"type": "string", "description": "Город"},
+      "num_days": {"type": "integer"}
+    },
+    "required": ["location", "num_days"]
+  },
+  "few_shot_examples": [
+    {"request": "Погода в Москве на 3 дня", "params": {"location": "Moscow", "num_days": 3}}
+  ],
+  "return_parameters": {"type": "object", "properties": {}}
+}
+
+Имя функции должно содержать только латинские буквы и не начинаться с цифры.
+
+Ответ 200 без стриминга:
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "текст ответа",
+        "functions_state_id": "uuid",
+        "function_call": {
+          "name": "weather_forecast",
+          "arguments": {"location": "Болхов", "num_days": 10}
+        }
+      },
+      "index": 0,
+      "finish_reason": "stop"
+    }
+  ],
+  "created": 1678878333,
+  "model": "GigaChat:2.0.28.2",
+  "object": "chat.completion",
+  "usage": {
+    "prompt_tokens": 1,
+    "completion_tokens": 4,
+    "precached_prompt_tokens": 37,
+    "total_tokens": 5
+  }
+}
+
+finish_reason может быть stop, length, function_call, blacklist, error. total_tokens уже учитывает вычитание кэшированных токенов.
+
+Стриминг при stream true. Ответ идёт как text/event-stream. Каждый фрагмент имеет вид data: {"choices":[{"delta":{"content":"...","role":"assistant"},"index":0}],...}. Предпоследнее событие содержит content пустую строку, finish_reason и usage. Последнее событие: data: [DONE].
+
+Логика работы с функциями:
+1) Передать functions и function_call auto.
+2) Если модель вернула message.function_call и finish_reason равен function_call, выполнить свою функцию с полученными arguments.
+3) Добавить в историю сообщение assistant с function_call и functions_state_id.
+4) Добавить сообщение function с content, равным JSON-строке результата.
+5) Отправить новый запрос с полной историей.
+6) Модель вернёт финальный текстовый ответ.
+
+Обязательно: каждому assistant.function_call в истории должен соответствовать function-ответ. Иначе ошибка 422 с сообщением every assistant function call must have a result in history.
+
+Генерация изображения встроенной функцией. Если передать function_call auto без functions, модель может вызвать text2image. В ответе content содержит <img src="file_id" fuse="true"/> и functions_state_id. Скачать изображение можно через GET /v1/files/{file_id}/content с тем же X-Client-ID, что был в запросе генерации.
+
+Ошибки v1:
+400 — некорректный формат запроса.
+401 — неавторизован.
+404 — неверный ID модели.
+422 — ошибка валидации параметров, превышение контекста или нарушение порядка system.
+429 — слишком много запросов.
+500 — внутренняя ошибка.
+
+РАЗДЕЛ ГЕНЕРАЦИИ ОТВЕТА V2
+
+Метод: POST https://api.giga.chat/v2/chat/completions
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Отличия от v1:
+1) Другая структура messages. content — массив объектов с text, files, function_call или function_result.
+2) Параметры модели вынесены в model_options.
+3) Инструменты передаются в tools. Встроенные инструменты: image_generate и model_3d_generate. Пользовательские функции передаются внутри tools.functions.specifications.
+4) Режим вызова задаётся в tool_config.mode: auto, none или forced.
+5) Поддерживаются параллельные вызовы при model_options.parallel_tool_calls true. Работает только для GigaChat-3-Ultra.
+6) Стриминг использует события response.message.delta, response.message.done, response.tool.in_progress, response.tool.completed.
+7) Роли: user, system, assistant, tool. Роль tool заменяет function из v1.
+
+Структура тела:
+{
+  "model": "GigaChat-2-Max",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"text": "Что на картинке?"},
+        {"files": [{"id": "file-uuid"}]}
+      ]
+    }
+  ],
+  "model_options": {
+    "temperature": 0,
+    "top_p": 1,
+    "max_tokens": 100,
+    "repetition_penalty": 1,
+    "update_interval": 0,
+    "unnormalized_history": false,
+    "response_format": {"type": "json_schema", "schema": {}, "strict": true},
+    "parallel_tool_calls": false,
+    "top_logprobs": 3
+  },
+  "stream": false,
+  "disable_filter": false,
+  "ranker_options": {"enabled": true, "top_n": 4, "embeddings_model": "Embeddings"},
+  "user_info": {"timezone": "Europe/Moscow"},
+  "tool_config": {"mode": "auto", "tool_name": "...", "function_name": "..."},
+  "tools": [
+    {"functions": {"specifications": [{}]}},
+    {"image_generate": {}},
+    {"model_3d_generate": {}}
+  ]
+}
+
+Роли в messages v2:
+user — сообщение пользователя. content содержит text и при необходимости files.
+system — системный промпт.
+assistant — ответ модели. content содержит text, function_call и tool_state_id.
+tool — результат функции. content содержит function_result с полями name и result.
+
+tool_config.mode:
+auto — модель сама решает, использовать ли инструменты. Используется по умолчанию, если есть tools.
+none — отключить инструменты.
+forced — принудительный вызов. Обязательно указать tool_name для встроенной функции или function_name для пользовательской функции.
+
+Ответ 200 без стриминга:
+{
+  "model": "GigaChat-2-Max",
+  "thread_id": "...",
+  "created_at": 1678904567,
+  "messages": [
+    {
+      "message_id": "...",
+      "role": "assistant",
+      "tool_state_id": "uuid",
+      "content": [
+        {"text": "ответ"},
+        {"files": [{"target": "image", "id": "file-uuid", "mime": "image/png"}]},
+        {"function_call": {"id": "uuid", "name": "get_weather", "arguments": {}}},
+        {"tool_execution": {"name": "image_generation", "status": "success"}},
+        {"logprobs": []},
+        {"inline_data": {"sources": {}, "images": []}}
+      ]
+    }
+  ],
+  "finish_reason": "stop",
+  "usage": {
+    "input_tokens": 10,
+    "input_tokens_details": {"cached_tokens": 3},
+    "output_tokens": 20,
+    "total_tokens": 30
+  }
+}
+
+finish_reason может быть stop, length, function_call, function_call_error, blacklist, request_blacklist, request_whitelist, request_filter, response_blacklist.
+
+Стриминг SSE события:
+response.message.delta — фрагмент сообщения.
+response.message.done — последнее событие вместо [DONE].
+response.tool.in_progress — инструмент выполняется.
+response.tool.completed — инструмент завершён.
+
+Принудительный вызов функции:
+tool_config: {"mode": "forced", "function_name": "weather_forecast"}
+tools: [{"functions": {"specifications": [{}]}}]
+
+Параллельные функции только для GigaChat-3-Ultra:
+model_options: {"temperature": 0, "parallel_tool_calls": true}
+tools: [{"functions": {"specifications": [func1, func2]}}]
+Модель может вернуть несколько function_call за один ответ.
+
+Логика работы с инструментами v2:
+1) Передать tools и tool_config.mode.
+2) Если модель вернула function_call, выполнить функцию.
+3) Отправить историю с assistant, содержащим function_call и tool_state_id, и tool, содержащим function_result с name и result.
+4) Модель вернёт финальный ответ.
+5) Для встроенного image_generate достаточно передать tools: [{"image_generate":{}}]. Модель вернёт files с target image.
+
+РАЗДЕЛ ЭМБЕДДИНГОВ
+
+Метод: POST https://api.giga.chat/v1/embeddings
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Тело:
+{
+  "model": "Embeddings",
+  "input": "текст"
+}
+
+model может быть Embeddings, Embeddings-2 или EmbeddingsGigaR.
+input может быть строкой или массивом строк.
+
+Ответ 200:
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.123, -0.456],
+      "index": 0,
+      "usage": {"prompt_tokens": 6}
+    }
+  ],
+  "model": "Embeddings"
+}
+
+index в data соответствует input. Чем ближе значения векторов по косинусному расстоянию, тем семантически ближе тексты. Тарификация одинакова для всех моделей эмбеддингов. Ошибки: 401 и 500.
+
+РАЗДЕЛ ФАЙЛОВ
+
+Загрузить файл: POST https://api.giga.chat/v1/files
+Заголовки: Authorization: Bearer <token>, Content-Type: multipart/form-data.
+
+Поля формы: file — бинарный файл, обязателен. purpose — general.
+
+Поддерживаемые форматы:
+Текстовые документы: txt, doc, docx, pdf, epub, ppt, pptx, xlsx.
+Изображения: jpeg, png, tiff, bmp.
+Аудио: mp4, mp3, m4a, wav, weba, ogg, opus.
+
+Лимиты: аудио до 35 Мб, изображение до 15 Мб, текст до 40 Мб.
+
+Ответ 200:
+{
+  "bytes": 120000,
+  "created_at": 1677610602,
+  "filename": "file123",
+  "id": "6f0b1291-c7f3-43c6-bb2e-9f3efb2dc98e",
+  "object": "file",
+  "purpose": "general",
+  "access_policy": "private",
+  "modalities": ["image"]
+}
+
+id использовать в attachments для v1 или в content.files для v2.
+
+Скачать файл: GET https://api.giga.chat/v1/files/{file_id}/content
+Заголовки: Authorization: Bearer <token>, X-Client-ID с тем же значением, что был при создании изображения.
+
+Важно: для скачивания сгенерированных изображений и 3D-моделей нужно передать тот же X-Client-ID, что был при запросе генерации. Иначе доступ к private-файлу будет запрещён. Ответ приходит как application/octet-stream.
+
+Список файлов: GET https://api.giga.chat/v1/files
+Заголовки: Authorization: Bearer <token>. Возвращает массив объектов файлов.
+
+Удалить файл: POST https://api.giga.chat/v1/files/{file_id}/delete
+Заголовки: Authorization: Bearer <token>. Переводит статус файла в deleted.
+
+Ответ 200:
+{
+  "id": "...",
+  "deleted": true,
+  "access_policy": "private"
+}
+
+Общая логика работы с файлами:
+1) Загрузить файл и получить id.
+2) Использовать id в запросе генерации: attachments в v1 или files в v2.
+3) Для скачивания сгенерированного файла вызвать GET /files/{id}/content с сохранением X-Client-ID.
+
+РАЗДЕЛ ВАЛИДАЦИИ ФУНКЦИИ
+
+Метод: POST https://api.giga.chat/v1/functions/validate
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Назначение: проверить описание пользовательской функции на соответствие формату GigaChat до отправки в /chat/completions.
+
+Тело — объект функции:
+{
+  "name": "send_sms",
+  "description": "Отправка SMS",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "contactId": {"type": "integer", "description": "ID контакта"},
+      "text": {"type": "string", "minLength": 1}
+    },
+    "required": ["contactId", "text"]
+  },
+  "return_parameters": {"type": "object", "properties": {}},
+  "few_shot_examples": [
+    {"request": "Отправь SMS контакту 111", "params": {"contactId": 111, "text": "Hello"}}
+  ]
+}
+
+Ответ 200:
+{
+  "status": 200,
+  "message": "Function is valid",
+  "json_ai_rules_version": "1.0.5",
+  "errors": [
+    {"description": "name is required", "schema_location": "(root)"}
+  ],
+  "warnings": [
+    {"description": "few_shot_examples are missing", "schema_location": "(root)"}
+  ]
+}
+
+message может быть Function is valid или Incorrect function syntax.
+
+Логика: если есть errors, функцию нельзя использовать, нужно исправить. Если только warnings, функция валидна, но есть замечания. errors и warnings взаимоисключающие: если есть ошибки, предупреждения не возвращаются. Ошибки: 400, 401, 429, 500.
+
+РАЗДЕЛ ПРОВЕРКИ ТЕКСТА НА ИИ
+
+Метод: POST https://api.giga.chat/v1/ai/check
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Назначение: определить, сгенерирован ли русскоязычный текст нейросетью. Доступ только для юридических лиц на pay-as-you-go. Минимальная длина текста 20 слов.
+
+Тело:
+{
+  "model": "GigaCheckClassification",
+  "input": "текст не короче 20 слов на русском"
+}
+
+model может быть GigaCheckClassification или GigaCheckDetection.
+GigaCheckClassification возвращает классы ai или human.
+GigaCheckDetection добавляет класс mixed для частично сгенерированных текстов.
+
+Ответ 200:
+{
+  "category": "mixed",
+  "characters": 500,
+  "tokens": 38,
+  "ai_intervals": [[0, 100], [150, 200]]
+}
+
+category может быть ai, human или mixed.
+ai_intervals — индексы символов ИИ-фрагментов. Если category равен ai или human, массив пустой.
+
+РАЗДЕЛ ПАКЕТНОЙ ОБРАБОТКИ
+
+Доступ только на pay-as-you-go.
+
+Создать пакетную задачу: POST https://api.giga.chat/v1/batches?method=chat_completions
+Заголовки: Authorization: Bearer <token>, Content-Type: application/octet-stream.
+
+method в query может быть chat_completions или embedder.
+Body — файл JSONL. Каждая строка — валидный JSON-объект с запросом на /chat/completions или /embeddings.
+
+Пример JSONL-строки:
+{"model":"GigaChat-2-Max","messages":[{"role":"user","content":"Привет"}]}
+
+Ответ 200:
+{
+  "id": "batch-uuid",
+  "method": "chat_completions",
+  "request_counts": {"total": 100},
+  "status": "created",
+  "created_at": 1678904567,
+  "updated_at": 1678904567
+}
+
+status может быть created, in_progress или completed.
+
+Получить статус: GET https://api.giga.chat/v1/batches?batch_id=<id>
+Заголовки: Authorization: Bearer <token>, Content-Type: application/json.
+
+Без batch_id возвращается список всех задач.
+
+Ответ 200:
+{
+  "batches": [
+    {
+      "id": "batch-uuid",
+      "method": "chat_completions",
+      "request_counts": {"total": 100, "completed": 80, "failed": 2},
+      "status": "in_progress",
+      "output_file_id": "...",
+      "created_at": 1678904567,
+      "updated_at": 1678904600
+    }
+  ]
+}
+
+output_file_id заполняется только при status completed.
+
+Логика пакетной обработки:
+1) Сформировать JSONL.
+2) POST /v1/batches?method=... — получить batch_id.
+3) Поллинг GET /v1/batches?batch_id=... до status completed.
+4) Скачать результат через GET /v1/files/{output_file_id}/content.
+5) Ошибки: 400, 401, 404 если batch не найден, 429, 500.
+
+РАЗДЕЛ ОБЩИХ ПАТТЕРНОВ
+
+Авторизация в каждом запросе: Authorization: Bearer <access_token>. Токен живёт 30 минут, поэтому его нужно кэшировать и обновлять по expires_at.
+
+Идентификаторы для логирования:
+X-Request-ID — UUIDv4 на каждый запрос. Если не задан, создаётся автоматически.
+X-Session-ID — UUIDv4 на сессию. Если не задан, создаётся автоматически.
+X-Client-ID — постоянный ID пользователя. Сохранять при работе с изображениями, потому что он нужен для скачивания.
+User-Agent — имя приложения.
+
+Кодировка: все content передавать в UTF-8. Это снижает расход токенов.
+
+Работа с контекстом:
+1) Для сохранения диалога передавать всю историю в messages.
+2) Системный промпт только первым и только один.
+3) Модели кэшируют контекст. precached_prompt_tokens вычитается из total_tokens. Для повышения вероятности кэша сохранять стабильный префикс сообщений.
+
+Чеклист работы с функциями:
+1) Описание функции валидировать через /v1/functions/validate.
+2) Имя функции только латиница и не с цифры.
+3) parameters — валидная JSON Schema с required.
+4) В истории каждому assistant.function_call должен соответствовать function-ответ в v1 или tool-ответ в v2.
+5) functions_state_id или tool_state_id передавать обратно в assistant-сообщении для сохранения состояния.
+
+Чеклист работы с файлами:
+1) Загрузить через /v1/files multipart.
+2) Использовать id в attachments для v1 или content.files для v2.
+3) Для текстовых документов в одном запросе генерации передавать только один id. Если передать несколько, будет использован только первый.
+4) Для изображений: одно изображение на сообщение, до 10 на сессию, общий размер запроса меньше 80 Мб.
+5) Скачивание сгенерированных файлов выполнять через GET /v1/files/{id}/content с тем же X-Client-ID.
+
+Стриминг:
+В v1 при stream true ответ идёт как SSE. Фрагменты имеют вид data: {...}. Конец потока data: [DONE].
+В v2 при stream true ответ идёт как SSE с событиями response.message.delta, response.message.done, response.tool.in_progress, response.tool.completed.
+usage приходит в предпоследнем событии.
+
+Структурированный вывод JSON:
+response_format: {"type": "json_schema", "schema": {"type": "object", "properties": {}, "required": []}, "strict": true}
+При strict true и наличии required модель вернёт все поля строго по схеме.
+
+Общие коды ошибок:
+400 — некорректный запрос. Проверить формат и поля.
+401 — неавторизован. Обновить токен.
+404 — неверный ID модели или batch не найден. Проверить ID.
+422 — ошибка валидации, превышение контекста или нарушение порядка system. Исправить параметры.
+429 — слишком много запросов. Повторить с задержкой.
+500 — внутренняя ошибка. Повторить.
+
+Ретраи: при 429 и 500 использовать экспоненциальный backoff. При 401 переполучить токен и повторить один раз.
+
+Выбор метода генерации:
+Обычный чат — v1 /chat/completions.
+Параллельные функции и сложные tool-сценарии — v2 /chat/completions с GigaChat-3-Ultra.
+Пакетная обработка — /batches и JSONL.
+Эмбеддинги — /embeddings.
+Генерация изображений — v1 chat с function_call auto и text2image.
+Генерация 3D — v1 chat с function_call auto и text2model3d, либо v2 с tools: [{"model_3d_generate":{}}].
+Проверка на ИИ — /ai/check только для юрлиц на pay-as-you-go.
+
+БЫСТРЫЙ СПРАВОЧНИК
+
+Получение токена:
+POST https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+Заголовки: RqUID, Authorization: Basic <key>.
+Тело: scope=GIGACHAT_API_PERS или GIGACHAT_API_B2B или GIGACHAT_API_CORP.
+Результат: access_token.
+
+Все остальные запросы:
+Authorization: Bearer <access_token>
+Accept: application/json
+X-Client-ID: <id> при работе с файлами и изображениями
+X-Request-ID: <uuid4>
+X-Session-ID: <uuid4>
+User-Agent: <app>
+
+Эндпоинты:
+GET /v1/models — список моделей.
+POST /v1/chat/completions — генерация v1.
+POST /v2/chat/completions — генерация v2.
+POST /v1/embeddings — эмбеддинги.
+POST /v1/functions/validate — валидация функции.
+POST /v1/ai/check — проверка на ИИ.
+POST /v1/files — загрузка файла.
+GET /v1/files — список файлов.
+GET /v1/files/{id}/content — скачать файл.
+POST /v1/files/{id}/delete — удалить файл.
+POST /v1/batches?method=chat_completions или embedder — создать batch.
+GET /v1/batches?batch_id=... — статус batch.
+
+Минимальный чат v1:
+POST https://api.giga.chat/v1/chat/completions
+Authorization: Bearer <token>
+Content-Type: application/json
+Тело:
+{
+  "model": "GigaChat-2-Max",
+  "messages": [{"role": "user", "content": "Привет!"}]
+}
+
+Минимальный чат v2:
+POST https://api.giga.chat/v2/chat/completions
+Authorization: Bearer <token>
+Content-Type: application/json
+Тело:
+{
+  "model": "GigaChat-2-Max",
+  "messages": [{"role": "user", "content": [{"text": "Привет!"}]}]
+}
+
+Минимальные эмбеддинги:
+POST https://api.giga.chat/v1/embeddings
+Authorization: Bearer <token>
+Content-Type: application/json
+Тело:
+{"model": "Embeddings", "input": "текст"}
+
+Минимальная загрузка файла:
+POST https://api.giga.chat/v1/files
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
+Поля: file=@document.pdf, purpose=general.
+
+Минимальный batch:
+1) Создать JSONL-файл requests.jsonl.
+2) POST https://api.giga.chat/v1/batches?method=chat_completions
+Заголовки: Authorization: Bearer <token>, Content-Type: application/octet-stream.
+Body: файл requests.jsonl.
+3) Поллинг GET https://api.giga.chat/v1/batches?batch_id=<id> с Authorization: Bearer <token>.
+4) Скачать результат GET https://api.giga.chat/v1/files/<output_file_id>/content с Authorization: Bearer <token>.
+
+КОНЕЦ ФАЙЛА
